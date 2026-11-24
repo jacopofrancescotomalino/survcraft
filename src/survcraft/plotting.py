@@ -11,128 +11,122 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn
+from itertools import cycle
 
 from .util import detect_max_survival_time
 
+def _extract_times_events(y):
+    """Return (times, events) from structured or 2-column targets."""
+    if y is None:
+        return None, None
 
-def plot_model(model, X, event, time):
-    r"""Plot failure curves and observed-time markers for five sampled rows.
+    if getattr(y, "dtype", None) is not None and y.dtype.names:
+        time_name = "time" if "time" in y.dtype.names else y.dtype.names[1]
+        event_name = "event" if "event" in y.dtype.names else y.dtype.names[0]
+        return y[time_name], y[event_name]
 
-    Parameters
-    ----------
-    model : SurvivalEstimator
-        Initialized model supporting the requested prediction modes.
-    X : numpy.ndarray, shape (n_samples, n_features)
-        Numeric feature matrix.
-    event : numpy.ndarray of bool, shape (n_samples,)
-        Event indicators; censoring markers use dotted lines.
-    time : numpy.ndarray, shape (n_samples,)
-        Observed event or censoring times.
-
-    Returns
-    -------
-    None
-        Creates a matplotlib figure and prints raw sample parameters.
-
-    Notes
-    -----
-    Samples rows with replacement using an unseeded local NumPy generator.
-    The current plotting horizon is fixed at 110, and markers are clipped
-    to that horizon.
-    """
-    rng = np.random.default_rng()
-    sub_idx = rng.choice(X.shape[0], size=5)
-    sub_times, sub_events = time[sub_idx], event[sub_idx]
-    # max_time = np.max(sub_times[sub_events])
-    # max_time = np.max(sub_times)
-    max_time = 100
-    times = np.linspace(0.0, max_time * 1.1, 200)
-    fail = model.predict("failure", X[sub_idx], times)
-    params = model.model_.get_raw_params(model._tensor(X[sub_idx]))
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for t, e, f, p in zip(sub_times, sub_events, fail, params):
-        color = ax._get_lines.get_next_color()
-        label = f"time={float(t):.3g}"
-        plt.plot(times, f, label=label, color=color)
-        t = min(np.max(times), t)  # clip times
-        plt.axvline(
-            t, linestyle="solid" if e else "dotted", label=label, color=color
-        )
-        print(p.detach())
-        # plt.xscale('log')
+    return y[:, 0], y[:, 1]
 
 
-def plot_outputs(model, X, max_time=None):
+def _get_colors(n_samples):
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+    cycler = cycle(color_cycle)
+    return [next(cycler) for _ in range(n_samples)]
+
+
+def plot_outputs(model, X, y = None, max_time=None):
     # time = np.linspace(0.0, times_train[events_train].max(), 101)
-    r"""Plot failure, survival, density, and hazard curves in four panels.
-
-    Parameters
-    ----------
-    model : SurvivalEstimator
-        Initialized model supporting the requested prediction modes.
-    X : numpy.ndarray, shape (n_samples, n_features)
-        Numeric feature matrix.
-    max_time : float, optional
-        Final evaluation time; inferred from survival curves if omitted.
-
-    Returns
-    -------
-    None
-        Creates a matplotlib figure with a logarithmic hazard axis.
-
-    Notes
-    -----
-    Uses 101 grid points including zero. Some densities or hazards are
-    singular at zero; such models may fail under divergence checks. Prints
-    the inferred horizon when max_time is omitted.
-
-    See Also
-    --------
-    survcraft.util.detect_max_survival_time : Horizon heuristic.
-    """
     if max_time is None:
         max_time = detect_max_survival_time(model, X)
         print("estimated max time:", max_time)  # time[-1].item())
-    time = np.linspace(0.0, max_time, 101)
+    time_grid = np.linspace(0.0, max_time, 101)
+    fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(15, 10), dpi = 100)
+    n_samples = X.shape[0]
+    # Pre-generate colors for consistent coloring across plots
+    alpha_opt = 1/np.sqrt(n_samples)
 
-    fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(10, 7))
-    axes[0][0].plot(time, model.predict("failure", X, time).T)
-    axes[0][0].set_title("failure")
+    # plots histogram of observations (only if y is provided)
+    if y is not None:
+        colors = _get_colors(n_samples)
+        times, events = _extract_times_events(y)
+        data = list(zip(events, times))
+        observed_times = [data[1] for data in data if data[0] == True]
+        censored_times = [data[1] for data in data if data[0] == False]
+        axes[0][0].hist(observed_times, bins=30, alpha=0.5, label='Observed', color='steelblue')
+        axes[0][0].hist(censored_times, bins=30, alpha=0.5, label='Censored', color='salmon')
+        axes[0][0].set_xlabel("Time")
+        axes[0][0].set_ylabel("Count")
+        axes[0][0].set_xlim(0, max_time)
+        axes[0][0].set_title("histogram of observations")
+        axes[0][0].legend()
+    
 
-    axes[0][1].plot(time, model.predict("survival", X, time).T)
+    # Plot curves with optional vertical lines for observed event times (color each curve according to the observed time and event status with the viridis colormap)
+    survival_preds = model.predict("survival", X, time_grid)
+    density_preds = model.predict("density", X, time_grid)
+    # Hazard can be legitimately infinite at t=0 (e.g. Weibull with shape < 1),
+    # which predict rejects; evaluate from the second grid point and leave t=0
+    # as NaN so matplotlib skips it.
+    hazard_tail = model.predict("hazard", X, time_grid[1:])
+    hazard_preds = np.concatenate(
+        [np.full((hazard_tail.shape[0], 1), np.nan, dtype=hazard_tail.dtype), hazard_tail], axis=1
+    )
+
+    if y is not None:
+        times, events = _extract_times_events(y)
+        cmap = plt.get_cmap('viridis')
+        max_obs_time = max(times)
+        min_obs_time = min(times)
+        colors = [cmap((t - min_obs_time) / (max_obs_time - min_obs_time)) for t in times]
+        # show colorbar for the survival plot
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(min_obs_time, max_obs_time))
+        sm.set_array([])
+        #align the colorbar with the complete plot, not only one of the subplots
+        cbar = plt.colorbar(sm, ax = axes[0][1], fraction=0.02, pad=0.04)
+        cbar.set_label('Observed Time')
+        alpha_values = [alpha_opt if e else alpha_opt / 2 for e in events]
+    else :
+        colors = _get_colors(n_samples)
+        alpha_values = [alpha_opt for e in range(n_samples)]
+    
+    for hazard, dens, surv, color, a_value in zip(hazard_preds, density_preds, survival_preds, colors, alpha_values):
+        axes[0][1].plot(time_grid, surv, color=color, alpha=a_value)
+        axes[1][0].plot(time_grid, dens, color=color, alpha=a_value)
+        axes[1][1].plot(time_grid, hazard, color=color, alpha=a_value)
+
     axes[0][1].set_title("survival")
-
-    # decide log or no log
-    axes[1][0].plot(time, model.predict("density", X, time).T)
-    # axes[1][0].set_yscale("log")
     axes[1][0].set_title("density")
-
-    axes[1][1].plot(time, model.predict("hazard", X, time).T)
-    axes[1][1].set_yscale("log")
     axes[1][1].set_title("hazard")
+    axes[0][1].set_xlabel("Time")
+    axes[0][1].set_ylabel("Survival Probability")
+    axes[1][0].set_xlabel("Time")
+    axes[1][0].set_ylabel("Density")
+    axes[1][1].set_xlabel("Time")
+    axes[1][1].set_ylabel("Hazard")
+    #axes[1][0].set_yscale("log")
+    #axes[1][1].set_yscale("log")
+    axes[0][1].set_xlim(0, max_time)
+    axes[1][0].set_xlim(0, max_time)
+    axes[1][1].set_xlim(0, max_time)
 
-    # axes[2][0].plot(time, model.predict("density", X, time).T)
-    # axes[2][0].set_title("density")
+    event_shape_dict = {True : 'X', False : 'P'}
 
-    # axes[2][1].plot(time, model.predict("hazard", X, time).T)
-    # axes[2][1].set_title("hazard")
-    return  # FIXME questi histogrammi non vanno bene
-    try:
-        axes[2][0].hist(model.predict("expected_time", X), bins=10)
-        # axes[2][0].set_yscale('log')
-    except NotImplementedError as e:
-        pass
-    axes[2][0].set_title("expected time")
-
-    try:
-        axes[2][1].hist(model.predict("median_time", X), bins=10, density=True)
-        # axes[2][1].set_yscale('log')
-    except NotImplementedError as e:
-        pass
-    axes[2][1].set_title("median time")
-    # axes[2][0].hist(model.predict('median_time', X_test))
-    # axes[2][0].hist(model.predict('median_time', X_test))
-
+    if y is not None :
+        for index, obs_time, obs_event, color, surv, dens, hazard in zip(range(n_samples), times, events, colors, survival_preds, density_preds, hazard_preds):
+            clipped_time = min(time_grid[-1], obs_time)
+            # Interpolate curve value at observed time to place one marker per curve.
+            surv_at_t = np.interp(clipped_time, time_grid, surv)
+            dens_at_t = np.interp(clipped_time, time_grid, dens)
+            hazard_at_t = np.interp(clipped_time, time_grid, hazard)
+            #axes[0][1].axvline(clipped_time, linestyle="solid" if obs_event else "dotted", color=color, alpha=alpha_opt)
+            if obs_event == False:
+                axes[0][1].scatter(clipped_time, surv_at_t, color=color, marker=event_shape_dict[obs_event], alpha=0.2)
+            #axes[1][0].axvline(clipped_time, linestyle="solid" if obs_event else "dotted", color=color, alpha=alpha_opt)
+            if obs_event == True:
+                axes[1][0].scatter(clipped_time, dens_at_t, color=color, marker=event_shape_dict[obs_event], alpha=0.2)
+                #axes[1][1].axvline(clipped_time, linestyle="solid" if obs_event else "dotted", color=color, alpha=alpha_opt)
+                axes[1][1].scatter(clipped_time, hazard_at_t, color=color, marker=event_shape_dict[obs_event], alpha=0.2)
+    return
 
 def get_training_history_table(model):
     r"""Convert recorded batch and test losses to a two-level table.
