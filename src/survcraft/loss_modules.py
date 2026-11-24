@@ -305,7 +305,10 @@ def full_likelihood_reference(model, x, events, times, censoring_alpha, check_di
 def _likelihood_log(preds):
     """Match nan_to_num(log(preds), nan=0, neginf=0) using safe operands."""
     loggable = (preds > 0) & preds.isfinite()
-    result = preds.masked_fill(~loggable, 1.0).log()
+    # Floor subnormal values at the smallest normal float: d log(p)/dp = 1/p
+    # overflows to inf for subnormal p, which turns into NaN gradients.
+    tiny = torch.finfo(preds.dtype).tiny
+    result = preds.masked_fill(~loggable, 1.0).clamp_min(tiny).log()
     # Keep the existing positive-infinity log value for the unchecked path.
     return result.masked_fill(preds.isposinf(), torch.finfo(preds.dtype).max)
 
