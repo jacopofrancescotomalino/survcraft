@@ -1244,7 +1244,7 @@ class LevySurvivalModule(BaseSurvivalModule):
 
     The mean is infinite, so expected_time raises NotImplementedError rather
     than returning infinity. Density at t=0 is numerically undefined in
-    this implementation. Hazard uses the base floor; risk is unimplemented.
+    the formula, so it returns the limit 0. Hazard uses the base floor; risk is unimplemented.
 
     Uses the shapes, modes, and device contract in :class:`BaseSurvivalModule`.
     Inherited epsilon and enable_checks options are forwarded to that class.
@@ -1292,7 +1292,10 @@ class LevySurvivalModule(BaseSurvivalModule):
         BaseSurvivalModule : Shared tensor and device contract.
         """
         D, x0 = params["D"], params["x0"]
-        return torch.erf(x0 / torch.sqrt(4 * D * times))
+        positive = times > 0
+        safe_times = torch.where(positive, times, torch.ones_like(times))
+        s = torch.erf(x0 / torch.sqrt(4 * D * safe_times))
+        return torch.where(positive, s, torch.ones_like(s))
 
     def failure(self, params, times):
         # CDF
@@ -1317,7 +1320,10 @@ class LevySurvivalModule(BaseSurvivalModule):
         BaseSurvivalModule : Shared tensor and device contract.
         """
         D, x0 = params["D"], params["x0"]
-        return torch.erfc(x0 / torch.sqrt(4 * D * times))
+        positive = times > 0
+        safe_times = torch.where(positive, times, torch.ones_like(times))
+        f = torch.erfc(x0 / torch.sqrt(4 * D * safe_times))
+        return torch.where(positive, f, torch.zeros_like(f))
 
     def density(self, params, times):
         # PDF (It is a Levy distribution with mu=0 and c = x0^2 * 1/(2D))
@@ -1342,9 +1348,13 @@ class LevySurvivalModule(BaseSurvivalModule):
         BaseSurvivalModule : Shared tensor and device contract.
         """
         D, x0 = params["D"], params["x0"]
-        numerator = D * x0 * torch.exp(-x0**2 / (4 * D * times))
-        denominator = 2 * self.sqrt_pi * (D * times)**(3/2)
-        return numerator / denominator
+        # The formula is 0/0 at t=0; its analytic limit is 0. Evaluate on safe
+        # times so neither the value nor its gradient becomes NaN.
+        positive = times > 0
+        safe_times = torch.where(positive, times, torch.ones_like(times))
+        numerator = D * x0 * torch.exp(-x0**2 / (4 * D * safe_times))
+        denominator = 2 * self.sqrt_pi * (D * safe_times)**(3/2)
+        return torch.where(positive, numerator / denominator, torch.zeros_like(numerator))
 
     def expected_time(self, params):
         # The mean is infinite
@@ -1423,8 +1433,8 @@ class InverseGaussianSurvivalModule(BaseSurvivalModule):
 
     Clamping changes the ideal inverse-Gaussian tail, and the product in S
     can lose precision. Parameter inspection reports the positive ``mu``
-    before drift clipping and sign conversion. Density is numerically
-    undefined at t=0. Median and risk are unimplemented; hazard uses the
+    before drift clipping and sign conversion. Density at t=0
+    returns its limit 0. Median and risk are unimplemented; hazard uses the
     base numerical floor.
 
     Uses the shapes, modes, and device contract in :class:`BaseSurvivalModule`.
@@ -1499,6 +1509,9 @@ class InverseGaussianSurvivalModule(BaseSurvivalModule):
         #print(f"mu range: [{mu.min().item():.4f}, {mu.max().item():.4f}]")
         #print(f"times range: [{times.min().item():.4f}, {times.max().item():.4f}]")
         
+        # S(0) = 1; evaluate on safe times so t=0 gives no NaN gradients.
+        positive = times > 0
+        times = torch.where(positive, times, torch.ones_like(times))
         # Compute the arguments for the normal CDF
         arg1 = (mu * times + x0) / torch.sqrt(times)
         arg2 = (mu * times - x0) / torch.sqrt(times)
@@ -1512,7 +1525,8 @@ class InverseGaussianSurvivalModule(BaseSurvivalModule):
         term2 = torch.exp(torch.clamp(-2 * x0 * mu, max=50)) * torch.special.ndtr(arg2)
         
         result = torch.clamp(term1 - term2, min=0, max=1)
-        
+        result = torch.where(positive, result, torch.ones_like(result))
+
         # Final diagnostic print
         #print(f"survival result range: [{result.min().item():.4f}, {result.max().item():.4f}]")
         
@@ -1574,6 +1588,9 @@ class InverseGaussianSurvivalModule(BaseSurvivalModule):
         BaseSurvivalModule : Shared tensor and device contract.
         """
         x0, mu = self._get_params(params)
+        # The formula is 0/0 at t=0; its analytic limit is 0 (x0 > 0).
+        positive = times > 0
+        times = torch.where(positive, times, torch.ones_like(times))
         denominator = self.sqrt2pi * torch.sqrt(times**3)
         exponent = -((x0 + mu * times)**2) / (2 * times)
         #print(f"Density: denominator range: [{denominator.min().item():.4e}, {denominator.max().item():.4e}]")
@@ -1581,8 +1598,8 @@ class InverseGaussianSurvivalModule(BaseSurvivalModule):
 
         result = (x0 / denominator) * torch.exp(exponent)
         #print(f"Density: result range: [{result.min().item():.4e}, {result.max().item():.4e}]")
-        
-        return result
+
+        return torch.where(positive, result, torch.zeros_like(result))
 
 
     def expected_time(self, params):
