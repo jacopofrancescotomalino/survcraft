@@ -253,6 +253,7 @@ class BaseSurvivalModule(torch.nn.Module):
         "survival",
         "density",
         "hazard",
+        "survival_and_density",
         "expected_time",
         "median_time",
         "risk",
@@ -454,6 +455,15 @@ class BaseSurvivalModule(torch.nn.Module):
 
     #  raise NotImplementedError(f'failure() not implemented in {type(self)}')
 
+    def survival_and_density(self, params, times):
+        '''
+        Returns both failure and density in one call.
+        By default, this is set to call failure() and density() separately, but can be overridden to provide a more
+        efficient implementation for specific survival modules (e.g. when the density is obtained from the failure
+        instead of an independent calculation).
+        '''
+        return self.survival(params, times), self.density(params, times)
+
     def survival(self, params, times):
         r"""Return survival probabilities S(t).
 
@@ -496,9 +506,11 @@ class BaseSurvivalModule(torch.nn.Module):
         -----
         Default implementation is density / clamp(survival, epsilon, 1).
         """
-        survival = self.survival(params, times)
-        density = self.density(params, times)
+        survival, density = self.survival_and_density(params, times)
+
         return density / torch.clamp(survival, self.epsilon, 1.0)
+
+
 
     def density(self, params, times):
         r"""Return the event-time probability density f(t).
