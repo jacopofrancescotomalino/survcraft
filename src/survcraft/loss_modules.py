@@ -312,6 +312,28 @@ def _likelihood_log(preds):
     # Keep the existing positive-infinity log value for the unchecked path.
     return result.masked_fill(preds.isposinf(), torch.finfo(preds.dtype).max)
 
+def full_likelihood_parallelized(model, params, events, times):
+    '''
+    version of the full likelihood loss that is parallelized, meaning it asks the model to compute both survival and density in one call.
+    This is more efficient for models which derive the density from the survival (or vice versa) instead of computing them independently,
+    since it avoids computing the same intermediate values twice.
+    To call this function instead of the default one, modify the call in the class FullLikelihoodLoss.
+    '''
+    n_samples = times.shape[0]
+        
+    unique_times, inverse_indeces = torch.unique(times, sorted=True, return_inverse=True)   # inverse_indeces is an array of lenght n_samples, where each element is the index of the corresponding time in unique_times
+        
+    survival, density = model("survival_and_density", params, unique_times)
+
+    # Select the appropriate density and survival values for each sample using the inverse indeces
+    row_indeces = torch.arange(n_samples, device=times.device)
+    density_at_time = density[row_indeces, inverse_indeces]
+    survival_at_time = survival[row_indeces, inverse_indeces]
+
+    event_loss = -safe_log(density_at_time[events]).sum() if events.any() else torch.tensor(0.0, device=times.device)
+    censoring_loss = -safe_log(survival_at_time[~events]).sum() if (~events).any() else torch.tensor(0.0, device=times.device)
+
+    return (event_loss + censoring_loss) / n_samples
 
 def full_likelihood_multi(model, x, events, times, skip, gpu, censoring_alpha, check_divergence="raise"):
     """Evaluate likelihood with indexing on CPU or fixed-size masks on GPU."""
