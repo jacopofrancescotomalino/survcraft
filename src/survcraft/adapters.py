@@ -52,6 +52,7 @@ __all__ = [
     "ProportionalHazardSurvivalAdapter",
     "AcceleratedFailureTimeSurvivalAdapter",
     "MixtureSurvivalAdapter",
+    "CompetingRisksSurvivalAdapter",
     "FractalNoiseSurvivalAdapter",
     "SurvivalEstimator",
     "SurvivalPredictor",
@@ -104,6 +105,25 @@ def _validate_time_grid(values: ArrayLike, *, name: str) -> numpy.ndarray:
     if not (grid[1:] > grid[:-1]).all():
         raise ValueError(f"{name} must remain strictly increasing after float32 conversion")
     return grid
+
+
+def _is_valid_event(event: numpy.ndarray) -> bool:
+    r"""Check that events are boolean indicators or nonnegative integer cause codes.
+
+    Parameters
+    ----------
+    event : numpy.ndarray
+        Event vector to check.
+
+    Returns
+    -------
+    bool
+        True for a boolean array (True = event, False = censored), or for an
+        integer array with values >= 0 (0 = censored, k >= 1 = event of cause k).
+    """
+    return event.dtype == numpy.bool_ or (
+        event.dtype.kind in "iu" and bool((event >= 0).all())
+    )
 
 
 # Input modules
@@ -274,9 +294,12 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
     See :class:`survcraft.survival_modules.BaseSurvivalModule` for raw and
     processed parameter shapes and prediction modes. Construction neither
     fits the module nor moves it to a device. Outcomes are boolean event
-    indicators and finite nonnegative times; both may be omitted for
-    simulation. Outcome-dependent adapters then use their documented
-    fallbacks. Nested adapters are recursively constructed by ``param_funcs``.
+    indicators or nonnegative integer cause codes (0 = censored, k >= 1 =
+    event of cause k), and finite nonnegative times; both may be omitted for
+    simulation. Unless ``competing_events`` is True, integer codes are
+    collapsed to the all-cause indicator ``event > 0`` before preprocessing.
+    Outcome-dependent adapters then use their documented fallbacks. Nested
+    adapters are recursively constructed by ``param_funcs``.
     """
     @property
     @abstractmethod
@@ -292,6 +315,10 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
 
     simulation_only: ClassVar[bool] = False
 
+    # if True, param_funcs receive integer cause codes unchanged; otherwise
+    # they receive the boolean all-cause indicator
+    competing_events: ClassVar[bool] = False
+
     # functions to be applied to parameters for preprocessing before passing it to the torch module (for instance for arrays that needs to be converted to tensors or for derived modules that need to initialized their submodules)
     param_funcs: ClassVar[
         dict[str, Callable[[Any, Optional[numpy.ndarray], Optional[numpy.ndarray]], Any]]
@@ -304,8 +331,9 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
 
         Parameters
         ----------
-        event : array-like of bool, shape (n_samples,), or None
-            True for observed events, False for right censoring.
+        event : array-like of bool or int, shape (n_samples,), or None
+            True for observed events, False for right censoring; or integer
+            cause codes, 0 for right censoring and k >= 1 for cause k.
         time : array-like, shape (n_samples,), or None
             Finite nonnegative observed event or censoring times.
 
@@ -326,8 +354,11 @@ class BaseSurvivalAdapter(BaseEstimator, ABC):
             event, time = numpy.asarray(event), numpy.asarray(time)
             if event.ndim != 1 or time.ndim != 1 or event.shape != time.shape:
                 raise ValueError("event and time must be matching one-dimensional arrays")
-            if event.dtype != numpy.bool_:
-                raise ValueError("event must be a boolean array")
+            if not _is_valid_event(event):
+                raise ValueError("event must be a boolean array or nonnegative integer cause codes")
+            if not self.competing_events:
+                # single-risk adapters see any cause as an event
+                event = event > 0
             if (
                 time.dtype.kind not in "iuf"
                 or not numpy.isfinite(time).all()
@@ -659,6 +690,135 @@ class MixtureSurvivalAdapter(BaseSurvivalAdapter):
         "baselines": preprocess_baselines,
     }
 
+
+@dataclass
+class CompetingRisksSurvivalAdapter(BaseSurvivalAdapter):
+    r"""Build a competing-risks model from independent latent cause distributions.
+
+    Parameters
+    ----------
+    latents : sequence of BaseSurvivalAdapter, optional
+        At least two latent factories in cause order: ``latents[k]`` models
+        event code ``k + 1``. Defaults to two WeibullSurvivalAdapter instances.
+    time_grid : int or array-like, default=100
+        Grid used to integrate the cumulative incidence functions. An integer
+        ``n`` requests the quantiles ``linspace(0, 1, n)`` of all observed
+        times (events of every cause and censoring), with zero added and
+        duplicates removed; without outcomes the grid is ``linspace(0, 1, n)``.
+        An array is used as an explicit zero-based, strictly increasing grid.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two latents are supplied, an event code exceeds the
+        number of latents, or a valid grid cannot be built.
+
+    Notes
+    -----
+    Uses :class:`BaseSurvivalAdapter` with ``competing_events = True``:
+    outcomes are integer cause codes (0 = censored, k >= 1 = cause k), and a
+    boolean indicator is read as codes 0/1. Each latent is constructed with
+    the boolean indicator ``event == k + 1``, so outcome-dependent latents
+    such as StepExpSurvivalAdapter use the event times of their own cause,
+    with censoring and the other causes treated as censored. Such latents
+    fail to build if their cause has no observed events.
+
+    The integration grid only affects the ``cif`` mode, which is not used by
+    the likelihood loss. Requested times outside the grid are still handled,
+    since they are added to the integration nodes, but with coarser steps.
+    See :class:`survcraft.survival_modules.CompetingRisksSurvivalModule` for
+    formulas and raw parameter ordering.
+    """
+    latents: Sequence[BaseSurvivalAdapter] = field(
+        default_factory=lambda: [WeibullSurvivalAdapter() for _ in range(2)]
+    )
+    time_grid: Union[int, ArrayLike] = 100
+
+    competing_events: ClassVar[bool] = True
+
+    @staticmethod
+    def preprocess_latents(
+        latents: Sequence[BaseSurvivalAdapter],
+        event: Optional[numpy.ndarray],
+        time: Optional[numpy.ndarray],
+    ) -> list[survival_modules.BaseSurvivalModule]:
+        r"""Construct each latent module from the outcomes of its own cause.
+
+        Parameters
+        ----------
+        latents : sequence of BaseSurvivalAdapter
+            At least two latent factories in cause order.
+        event : numpy.ndarray of bool or int, or None
+            Validated cause codes; latent k receives ``event == k + 1``.
+        time : numpy.ndarray or None
+            Matching observed times, shared by all latents.
+
+        Returns
+        -------
+        list of survcraft.survival_modules.BaseSurvivalModule
+            Fresh latent modules in cause order.
+
+        Raises
+        ------
+        ValueError
+            If fewer than two latents are supplied, an event code exceeds the
+            number of latents, or a latent fails to build.
+        """
+        if len(latents) < 2:
+            raise ValueError("latents must be a sequence of at least two survival adapter instances")
+        if event is not None and event.max(initial=0) > len(latents):
+            raise ValueError(f"event codes go up to {event.max()} but only {len(latents)} latents are defined")
+        return [
+            latent.get_module(None if event is None else event == k + 1, time)
+            for k, latent in enumerate(latents)
+        ]
+
+    @staticmethod
+    def preprocess_time_grid(
+        time_grid: Union[int, ArrayLike],
+        event: Optional[numpy.ndarray],
+        time: Optional[numpy.ndarray],
+    ) -> Tensor:
+        r"""Convert an explicit grid or observed-time quantiles to a float32 grid.
+
+        Parameters
+        ----------
+        time_grid : int or array-like
+            Grid specification described in :class:`CompetingRisksSurvivalAdapter`.
+        event : numpy.ndarray or None
+            Validated cause codes; unused, since every observed time counts.
+        time : numpy.ndarray or None
+            Observed times whose quantiles define the grid.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_grid,)
+            Zero-based, finite, strictly increasing grid on the CPU.
+
+        Raises
+        ------
+        ValueError
+            If the specification is invalid or yields fewer than two points.
+        """
+        if isinstance(time_grid, (int, numpy.integer)):
+            if time_grid < 2:
+                raise ValueError("time_grid count must be at least two")
+            quantiles = numpy.linspace(0.0, 1.0, time_grid)
+            if time is not None:
+                # quantiles concentrate nodes where data are; zero is the integration origin
+                grid = numpy.unique(numpy.concatenate([[0.0], numpy.quantile(time, quantiles)]))
+            else:
+                grid = quantiles
+        else:
+            grid = time_grid
+        return torch.tensor(_validate_time_grid(grid, name="time_grid"))
+
+    module_class = survival_modules.CompetingRisksSurvivalModule
+    param_funcs = {
+        "latents": preprocess_latents,
+        "time_grid": preprocess_time_grid,
+    }
+
 def shape2str(x: Union[Tensor, numpy.ndarray]) -> str:
     r"""Format tensor or array dimensions for diagnostics.
 
@@ -937,6 +1097,10 @@ class SurvivalEstimator(BaseEstimator):
     exactly two scalar fields: boolean event first, finite nonnegative time
     second. Field names are arbitrary. True means an observed event; False
     means right censoring. ``train`` accepts separate outcome vectors.
+    For competing risks the event field holds nonnegative integer cause codes:
+    0 means right censoring and k >= 1 an event of cause k. Boolean events
+    become boolean tensors and integer codes int64 tensors. Single-risk
+    adapters and losses use the all-cause indicator ``event > 0``.
 
     Time-dependent modes are ``failure``, ``survival``, ``density``, and
     ``hazard``. A shared time vector gives ``(n_samples, n_times)`` outputs;
@@ -1046,8 +1210,8 @@ class SurvivalEstimator(BaseEstimator):
         ----------
         X : numpy.ndarray, shape (n_samples, n_features)
             Numeric feature matrix.
-        event : numpy.ndarray of bool, shape (n_samples,)
-            Observed-event indicators.
+        event : numpy.ndarray of bool or int, shape (n_samples,)
+            Observed-event indicators or nonnegative integer cause codes.
         time : numpy.ndarray, shape (n_samples,), optional
             Required observed times; the None path is unimplemented.
         device : str or torch.device, optional
@@ -1056,7 +1220,7 @@ class SurvivalEstimator(BaseEstimator):
         Returns
         -------
         tuple of torch.Tensor
-            Float32 features, boolean events, and float32 times.
+            Float32 features, boolean or int64 events, and float32 times.
 
         Raises
         ------
@@ -1083,12 +1247,15 @@ class SurvivalEstimator(BaseEstimator):
                 warnings.warn(f'Found {ztime.sum()} ({ztime.mean():.2%}) times equal to zero, these can cause problem in training for some survival modules (e.g. Weibull)')
 
             assert X.shape[0] == time.shape[0]
-            assert event.dtype == bool, (
-                "event is not boolean, perhaps we should accept 0/1 arrays? numpy.unique(event)="
+            assert _is_valid_event(event), (
+                "event must be boolean or nonnegative integer cause codes, numpy.unique(event)="
                 + str(numpy.unique(event))
             )
             assert all(time >= 0.0)
-            event_t = self._tensor(event, dtype=torch.bool, device=device)
+            # boolean indicators stay boolean; cause codes become int64 for indexing
+            event_t = self._tensor(
+                event, dtype=torch.bool if event.dtype == bool else torch.long, device=device
+            )
             time_t = self._tensor(time, device=device)
         X_t = self._tensor(X, device=device)
         return X_t, event_t, time_t
@@ -1452,7 +1619,8 @@ class SurvivalPredictor(SurvivalEstimator):
         Parameters
         ----------
         y : numpy.ndarray, shape (n_samples,)
-            Exactly two scalar fields: boolean event, then real numeric time.
+            Exactly two scalar fields: boolean event or nonnegative integer
+            cause code, then real numeric time.
         name : str
             Argument name used in diagnostics.
 
@@ -1472,8 +1640,8 @@ class SurvivalPredictor(SurvivalEstimator):
         if names is None or len(names) != 2:
             raise ValueError(f"{name} must have exactly two fields: event first, time second")
         event, time = y[names[0]], y[names[1]]
-        if event.ndim != 1 or event.dtype != numpy.bool_:
-            raise ValueError(f"{name}'s first field must contain scalar boolean events")
+        if event.ndim != 1 or not _is_valid_event(event):
+            raise ValueError(f"{name}'s first field must contain scalar boolean events or nonnegative integer cause codes")
         if time.ndim != 1 or time.dtype.kind not in "iuf":
             raise ValueError(f"{name}'s second field must contain scalar real numeric times")
         if not numpy.isfinite(time).all() or (time < 0).any():
@@ -1494,7 +1662,8 @@ class SurvivalPredictor(SurvivalEstimator):
         X : numpy.ndarray, shape (n_samples, n_features)
             Numeric features following :class:`SurvivalEstimator`.
         y : numpy.ndarray, shape (n_samples,)
-            Structured target with boolean event first and numeric time second;
+            Structured target with boolean event (or integer cause code) first
+            and numeric time second;
             field names are arbitrary. Times must be finite and nonnegative.
         X_test : numpy.ndarray, optional
             Features for optional test-loss history.
@@ -1555,8 +1724,9 @@ class SurvivalPredictor(SurvivalEstimator):
         ----------
         X : numpy.ndarray, shape (n_samples, n_features)
             Numeric feature matrix.
-        event : numpy.ndarray of bool, shape (n_samples,)
-            True for observed events, False for right censoring.
+        event : numpy.ndarray of bool or int, shape (n_samples,)
+            True for observed events, False for right censoring; or integer
+            cause codes, 0 for right censoring and k >= 1 for cause k.
         time : numpy.ndarray, shape (n_samples,)
             Finite nonnegative event or censoring times. Zero times trigger a
             warning because some distributions are singular there.
@@ -1581,7 +1751,8 @@ class SurvivalPredictor(SurvivalEstimator):
             simulation-only, times are negative, module construction fails,
             or prediction divergence violates the policy.
         AssertionError
-            If sample counts do not match or event dtype is not boolean.
+            If sample counts do not match or events are neither boolean nor
+            nonnegative integer codes.
         FailedConvergence
             If every training batch in an epoch is skipped, or a non-finite
             training loss occurs with check_divergence="raise".
