@@ -18,51 +18,57 @@ __all__ = [
     "SquaredLoss",
     "PartialLikelihoodLoss",
     "FullLikelihoodLoss",
+    "CompetingRisksLikelihoodLoss",
     "BrierBatchTimesLoss",
     "BCEBatchTimesLoss",
 ]
 
 
 def check_survival_outcomes(events, times):
-    r"""Check boolean event dtype and matching one-dimensional outcome shapes.
+    r"""Check event dtype and outcome shapes, returning all-cause indicators.
 
     Parameters
     ----------
-    events : torch.Tensor of bool, shape (n_samples,)
-        Observed-event indicators.
+    events : torch.Tensor of bool or integer, shape (n_samples,)
+        Observed-event indicators, or cause codes with 0 for right censoring
+        and k >= 1 for an event of cause k.
     times : torch.Tensor, shape (n_samples,)
         Matching event or censoring times.
 
     Returns
     -------
-    None
-        Returns normally if the checks pass.
+    torch.Tensor of bool, shape (n_samples,)
+        ``events`` itself if boolean, otherwise the all-cause indicator
+        ``events > 0``.
 
     Raises
     ------
     TypeError
-        If events is not boolean.
+        If events is neither boolean nor integer.
     ValueError
         If events is not one-dimensional or times has a different shape.
 
     Notes
     -----
-    This helper does not check nonnegativity, finiteness, nonempty input,
-    or device compatibility. Callers must satisfy the full loss contract.
+    This helper does not check nonnegativity of codes or times, finiteness,
+    nonempty input, or device compatibility. Callers must satisfy the full
+    loss contract.
     """
-    if events.dtype is not torch.bool:
+    if events.dtype is not torch.bool and (events.is_floating_point() or events.is_complex()):
         raise TypeError(
-            f"Expected events to be a boolean vector, got {events.dtype}"
+            f"Expected events to be a boolean vector or integer cause codes, got {events.dtype}"
         )
     if len(events.shape) != 1:
         raise ValueError(
-            f"Expected event to be a boolean vector, got {events.shape}"
+            f"Expected event to be a vector, got {events.shape}"
         )
 
     if events.shape != times.shape:
         raise ValueError(
             f"Expected event and time to be equal length vectors, got {events.shape=} != {times.shape=}"
         )
+    # single-risk objectives treat an event of any cause as an event
+    return events if events.dtype is torch.bool else events > 0
 
 
 
@@ -335,18 +341,37 @@ def full_likelihood_parallelized(model, params, events, times):
 
     return (event_loss + censoring_loss) / n_samples
 
-def full_likelihood_multi(model, x, events, times, skip, gpu, censoring_alpha, check_divergence="raise"):
-    """Evaluate likelihood with indexing on CPU or fixed-size masks on GPU."""
+def full_likelihood_multi(model, x, events, times, skip, gpu, censoring_alpha, check_divergence="raise", event_mode="density"):
+    """Evaluate likelihood with indexing on CPU or fixed-size masks on GPU.
+
+    ``events`` holds boolean indicators for ``event_mode="density"``, or int64
+    cause codes for ``event_mode="cs_density"``, in which case the event term
+    of a sample with code k uses the k-th subdensity.
+    """
+    observed = events > 0  # identity for booleans, all-cause indicator for codes
+
     def func(mode, mask):
         if gpu:
-            preds = torch.diagonal(model(mode, x, times, check_divergence=check_divergence))
+            x_, t_, e_ = x, times, events
+        else:
+            x_, t_, e_ = x[mask], times[mask], events[mask]
+        # The diagonal pairs each sample with its own time: shape (m,) for
+        # single-risk modes, (n_causes, m) for cause-specific modes.
+        preds = torch.diagonal(model(mode, x_, t_, check_divergence=check_divergence), dim1=0, dim2=1)
+        if preds.ndim == 2:
+            if e_.numel() and e_.max() > preds.shape[0]:
+                raise ValueError(f"event codes go up to {e_.max().item()} but the model has {preds.shape[0]} causes")
+            # Keep the subdensity of each sample's observed cause (code k -> row k-1).
+            # Censored samples (code 0) read row 0 and are then masked out on GPU,
+            # or are absent from the CPU subset.
+            preds = preds.gather(0, (e_.long() - 1).clamp_min(0).unsqueeze(0)).squeeze(0)
+        if gpu:
             if skip:
                 mask = mask & preds.isfinite()
             n = mask.sum()
             # Remove unused values before log, including zero probabilities.
             preds = preds.masked_fill(~mask, 1.0)
         else:
-            preds = torch.diagonal(model(mode, x[mask], times[mask], check_divergence=check_divergence))
             if skip:
                 preds = preds[preds.isfinite()]
             n = preds.new_tensor(len(preds))
@@ -354,8 +379,8 @@ def full_likelihood_multi(model, x, events, times, skip, gpu, censoring_alpha, c
         # a non-finite scalar below so training can skip its optimizer step.
         return -_likelihood_log(preds).sum(), n
 
-    loss_events, n_events = func("density", events)
-    loss_censor, n_censor = func("survival", ~events)
+    loss_events, n_events = func(event_mode, observed)
+    loss_censor, n_censor = func("survival", ~observed)
     return (loss_events + censoring_alpha * loss_censor) / (n_events + n_censor)
 
 
@@ -459,7 +484,7 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
         FullLikelihoodLoss : Implemented formula and reduction.
         BaseSurvivalLoss : Shared model, tensor, and device contracts.
         """
-        check_survival_outcomes(events, times)
+        events = check_survival_outcomes(events, times)
 
         skip = check_divergence == "skip"
         policy = "no" if skip else check_divergence
@@ -468,6 +493,102 @@ class FullLikelihoodLoss(BaseSurvivalLoss):
             return full_likelihood_reference(model, x, events, times, self.censoring_alpha, policy)
         else:
             return full_likelihood_multi(model, x, events, times, skip, self.gpu, self.censoring_alpha, policy)
+
+
+class CompetingRisksLikelihoodLoss(FullLikelihoodLoss):
+    r"""Minimize the negative competing-risks log likelihood.
+
+    Parameters
+    ----------
+    censoring_alpha : float, default=1.0
+        Nonnegative weight multiplying the censored likelihood contribution.
+    gpu_mode : bool, default=False
+        Use fixed-size masks when True, or index event/censor groups when
+        False. The legacy reference path (None) is not available.
+
+    Raises
+    ------
+    ValueError
+        If censoring_alpha is negative, gpu_mode is None, or at evaluation an
+        event code exceeds the number of model causes.
+
+    Notes
+    -----
+    Events are integer cause codes :math:`e_i\in\{0,\dots,K\}`, 0 meaning right
+    censoring; a boolean indicator is read as a single cause (codes 0/1). With
+    the subdensity :math:`f_k(t)=h_k(t)S(t)` (mode ``cs_density``) and the
+    all-cause survival :math:`S` (mode ``survival``),
+
+    .. math::
+
+        L=-\frac1N\sum_i\left[
+            [e_i>0]\,\ell\bigl(f_{e_i}(t_i)\bigr)
+            +\alpha[e_i=0]\,\ell\bigl(S(t_i)\bigr)\right],
+
+    with :math:`\ell`, empty-group handling, and the skip policy as in
+    :class:`FullLikelihoodLoss`. For a single cause it equals
+    :class:`FullLikelihoodLoss`. For a
+    :class:`survcraft.survival_modules.CompetingRisksSurvivalModule` both
+    terms are closed-form products of latent outputs, so no cumulative
+    incidence integral is computed. The model must provide ``n_causes`` at
+    least as large as the largest event code. Uses the
+    :class:`BaseSurvivalLoss` contract.
+    """
+    def __init__(self, censoring_alpha: float = 1.0, gpu_mode: bool = False):
+        r"""Initialize objective options and registered state.
+
+        See Also
+        --------
+        CompetingRisksLikelihoodLoss : Constructor parameters and objective definition.
+        """
+        if gpu_mode is None:
+            raise ValueError("gpu_mode=None (legacy reference path) is not available for competing risks")
+        super().__init__(censoring_alpha, gpu_mode)
+
+    def forward(self, model, x, events, times, *, check_divergence="raise"):
+        r"""Compute the scalar objective defined by this loss.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            Callable ``model(mode, x, times=None, *, check_divergence="raise")``
+            following the prediction contract of survcraft.adapters.TorchModel,
+            supporting the ``cs_density`` and ``survival`` modes.
+        x : torch.Tensor, shape (n_samples, n_features)
+            Floating feature matrix on the model device.
+        events : torch.Tensor of int or bool, shape (n_samples,)
+            Cause codes, 0 for right censoring and k >= 1 for cause k; a
+            boolean tensor is read as codes 0/1.
+        times : torch.Tensor, shape (n_samples,)
+            Finite nonnegative event or censoring times on the model device.
+        check_divergence : {"raise", "warn", "skip", "no"}, default="raise"
+            Per-call policy following :meth:`BaseSurvivalLoss.forward`.
+
+        Returns
+        -------
+        torch.Tensor, shape ()
+            Scalar loss to minimize.
+
+        Raises
+        ------
+        TypeError
+            If events are neither boolean nor integer.
+        ValueError
+            If outcome shapes are invalid or an event code exceeds the number
+            of model causes.
+
+        See Also
+        --------
+        CompetingRisksLikelihoodLoss : Implemented formula and reduction.
+        BaseSurvivalLoss : Shared model, tensor, and device contracts.
+        """
+        check_survival_outcomes(events, times)  # validation only; codes are kept
+        skip = check_divergence == "skip"
+        policy = "no" if skip else check_divergence
+        return full_likelihood_multi(
+            model, x, events.long(), times, skip, self.gpu, self.censoring_alpha, policy,
+            event_mode="cs_density",
+        )
 
 
 def brier(preds, pred_times, events, times):
@@ -573,7 +694,7 @@ class BrierLoss(BaseSurvivalLoss):
         BrierLoss : Implemented formula and reduction.
         BaseSurvivalLoss : Shared model, tensor, and device contracts.
         """
-        check_survival_outcomes(events, times)
+        events = check_survival_outcomes(events, times)
 
         utimes = torch.unique(times[events] if events.any() else times)
         preds, retained = _predict_with_mask(model, "failure", x, utimes, check_divergence=check_divergence)
@@ -743,7 +864,7 @@ class ClassificationLoss(BaseSurvivalLoss):
         ClassificationLoss : Implemented formula and reduction.
         BaseSurvivalLoss : Shared model, tensor, and device contracts.
         """
-        check_survival_outcomes(events, times)
+        events = check_survival_outcomes(events, times)
 
         # get predictions at appropriate times
         pred_times = self.get_times(events, times)
@@ -1062,7 +1183,7 @@ class SquaredLoss(BaseSurvivalLoss):
         SquaredLoss : Implemented formula and reduction.
         BaseSurvivalLoss : Shared model, tensor, and device contracts.
         """
-        check_survival_outcomes(events, times)
+        events = check_survival_outcomes(events, times)
         preds, retained = _predict_with_mask(model, "expected_time", x, check_divergence=check_divergence)
         if retained is not None:
             preds = preds[retained]
@@ -1356,5 +1477,5 @@ class PartialLikelihoodLoss(BaseSurvivalLoss):
         PartialLikelihoodLoss : Implemented formula and reduction.
         BaseSurvivalLoss : Shared model, tensor, and device contracts.
         """
-        check_survival_outcomes(events, times)
+        events = check_survival_outcomes(events, times)
         return partial_likelihood_vec_safe(model, x, events, times, epsilon=self.epsilon, check_divergence=check_divergence)
