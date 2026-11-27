@@ -242,6 +242,16 @@ class BaseSurvivalModule(torch.nn.Module):
     nonnegative values, and leaves NaNs unchanged. Range checks do not check
     finiteness or monotonicity; the estimator's TorchModel checks finiteness.
 
+    Cause-specific modes ``cif``, ``cs_density``, ``cs_hazard``, and
+    ``latent_survival`` describe ``n_causes`` competing events and append a
+    trailing cause axis: ``(n_samples, n_times, n_causes)`` for a time vector
+    and ``(n_samples, n_causes)`` for a scalar time. ``cif`` and
+    ``latent_survival`` are clamped to [0, 1]. Single-risk modules have
+    ``n_causes = 1`` and their defaults are the corresponding all-cause
+    quantities (failure, density, hazard, survival) with a unit cause axis,
+    so every module can be used where a one-cause competing model is expected.
+    See :class:`CompetingRisksSurvivalModule` for K > 1.
+
     See Also
     --------
     survcraft.adapters.BaseSurvivalAdapter : Construction from estimator options.
@@ -258,7 +268,15 @@ class BaseSurvivalModule(torch.nn.Module):
         "median_time",
         "risk",
         "params",
+        "cif",
+        "cs_density",
+        "cs_hazard",
+        "latent_survival",
     }
+    # modes whose output carries a trailing axis of length n_causes
+    cause_modes = {"cif", "cs_density", "cs_hazard", "latent_survival"}
+    # number of competing causes; single-risk modules are one-cause models
+    n_causes = 1
 
     def __init__(self, params, epsilon: float = 1e-8, enable_checks: bool = False):
         r"""Initialize parameter groups and registered distribution state.
@@ -393,6 +411,10 @@ class BaseSurvivalModule(torch.nn.Module):
                 ret = ret[:, 0]
 
             expected_shape = raw_params.shape[:-1] + times.shape
+            # cause-specific modes add a last axis indexing the competing causes;
+            # keeping it last makes the scalar-time squeeze above valid for them too
+            if mode in self.cause_modes:
+                expected_shape = expected_shape + (self.n_causes,)
 
         if ret.shape != expected_shape:
             raise ValueError(
@@ -415,7 +437,7 @@ class BaseSurvivalModule(torch.nn.Module):
 
             # check for values above 1
             ret_max = ret.max().item()
-            if mode in {"failure", "survival"} and ret_max > 1:
+            if mode in {"failure", "survival", "cif", "latent_survival"} and ret_max > 1:
                 msg = f"Found {(ret > 1).sum().item()} values greater than 1.0 in {mode} survival output  of {self.__class__.__name__} with maximum value {ret_max} (exceeding 1.0 by {ret_max - 1.0})"
                 if ret_max - 1.0 < 1e6:
                     warn(msg)
@@ -423,7 +445,7 @@ class BaseSurvivalModule(torch.nn.Module):
                     raise RuntimeError(msg)
         
         # clamping results to correct mistakes due to numerical instability
-        if mode in {"failure", "survival"}:
+        if mode in {"failure", "survival", "cif", "latent_survival"}:
             ret = ret.clamp(min=0.0, max=1.0)
         elif mode != "risk":
             ret = ret.clamp(min=0.0)
@@ -621,6 +643,78 @@ class BaseSurvivalModule(torch.nn.Module):
         raise NotImplementedError(
             f"risk method not implemented in {type(self).__name__}"
         )
+
+    # One-cause defaults of the cause-specific modes. With a single cause the
+    # cumulative incidence is the failure function, the subdensity is the
+    # density, and the cause-specific and latent quantities coincide with the
+    # all-cause ones. Competing-risk modules override all four.
+    def cif(self, params, times):
+        r"""Return cumulative incidence functions F_k(t), one per cause.
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Transformed groups from preprocess_params.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Default for one cause: ``failure`` with a unit trailing axis.
+        """
+        return self.failure(params, times).unsqueeze(-1)
+
+    def cs_density(self, params, times):
+        r"""Return cause-specific subdensities f_k(t) = dF_k(t)/dt.
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Transformed groups from preprocess_params.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Default for one cause: ``density`` with a unit trailing axis.
+        """
+        return self.density(params, times).unsqueeze(-1)
+
+    def cs_hazard(self, params, times):
+        r"""Return cause-specific hazards h_k(t) = f_k(t) / S(t).
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Transformed groups from preprocess_params.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Default for one cause: ``hazard`` with a unit trailing axis.
+        """
+        return self.hazard(params, times).unsqueeze(-1)
+
+    def latent_survival(self, params, times):
+        r"""Return latent survival functions S_k(t), one per cause.
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Transformed groups from preprocess_params.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Default for one cause: ``survival`` with a unit trailing axis.
+        """
+        return self.survival(params, times).unsqueeze(-1)
 
 
 """### New survival models"""
@@ -2535,6 +2629,361 @@ class MixtureSurvivalModule(BaseSurvivalModule):
     #    return self._average_baselines("median_time", params)
 
 
+class CompetingRisksSurvivalModule(BaseSurvivalModule):
+    r"""Combine independent latent cause-specific distributions into competing risks.
+
+    Parameters
+    ----------
+    latents : sequence of BaseSurvivalModule
+        At least two latent distributions in cause order: ``latents[k]``
+        models the event with integer code ``k + 1``.
+    time_grid : torch.Tensor, shape (n_grid,)
+        Finite, strictly increasing floating grid starting at zero, used to
+        integrate the cumulative incidence functions.
+    *args : tuple
+        Positional BaseSurvivalModule options after params: epsilon, enable_checks.
+    **kwargs : dict
+        Keyword BaseSurvivalModule options: epsilon, enable_checks.
+
+    Attributes
+    ----------
+    latents : torch.nn.ModuleDict
+        Latent modules keyed by class name followed by the cause index.
+    time_grid : torch.Tensor
+        Registered buffer holding the integration grid.
+    n_causes : int
+        Number of competing causes, ``len(latents)``.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two latents are supplied or the grid is invalid.
+
+    Notes
+    -----
+    For cause k let :math:`S_k`, :math:`f_k`, :math:`h_k=f_k/S_k`, and
+    :math:`H_k=-\log S_k` be the latent survival, density, hazard, and
+    cumulative hazard: the distribution the event time of cause k would have
+    if no other cause existed. The cumulative incidence functions solve
+
+    .. math::
+
+        \frac{dF_k(t)}{dt}=h_k(t)\Bigl(1-\sum_j F_j(t)\Bigr),\qquad F_k(0)=0.
+
+    Summing over k gives the all-cause survival in closed form,
+
+    .. math::
+
+        S(t)=1-\sum_k F_k(t)=\exp\Bigl(-\sum_k H_k(t)\Bigr)=\prod_k S_k(t),
+
+    which is the independent latent failure time model. Hence the following
+    modes are exact and need no integration: ``survival`` :math:`=\prod_k S_k`,
+    ``failure`` :math:`=1-S`, ``cs_hazard`` :math:`=h_k`, ``hazard``
+    :math:`=\sum_k h_k`, ``cs_density`` :math:`=h_kS=f_k\prod_{j\neq k}S_j`,
+    ``density`` :math:`=\sum_k f_k\prod_{j\neq k}S_j`, and
+    ``latent_survival`` :math:`=S_k`. Training with
+    :class:`survcraft.loss_modules.CompetingRisksLikelihoodLoss` therefore
+    never integrates.
+
+    Only ``cif`` requires a quadrature. It is evaluated on the sorted union of
+    ``time_grid`` and the requested times, :math:`0=u_0<\dots<u_L`, assuming
+    the latent hazards are constant within each interval. With
+    :math:`\Delta H_{k,m}=H_k(u_{m+1})-H_k(u_m)` and
+    :math:`\Delta H_m=\sum_k\Delta H_{k,m}`, each step integrates the ODE
+    exactly under that assumption:
+
+    .. math::
+
+        F_k(u_{m+1})-F_k(u_m)=\Delta H_{k,m}\,S(u_m)\,
+            \frac{1-e^{-\Delta H_m}}{\Delta H_m}.
+
+    The increments of all causes sum to :math:`S(u_m)-S(u_{m+1})`, so
+    :math:`\sum_kF_k=1-S` holds up to rounding at every node and each
+    :math:`F_k` is non-decreasing. The step is exact when the latent hazards
+    are proportional within each interval (for instance piecewise-constant
+    hazards with breaks on the grid, or a single cause); otherwise the error
+    shrinks with the grid spacing. Only latent survival values are used, so
+    densities that are singular at zero do not affect the integral. Latent
+    distributions are assumed to satisfy :math:`S_k(0)=1`.
+
+    Latent distributions are identifiable from competing-risks data only
+    through the independence assumption built into this model.
+
+    Raw parameters are the raw parameters of each latent concatenated in
+    cause order, with keys ``ClassName_#k``; the groups stay raw until each
+    latent preprocesses them. Latents are evaluated through their own
+    ``forward``, so their outputs are clamped to valid ranges. Expected time,
+    median time, and risk are unimplemented.
+
+    Uses the shapes, modes, and device contract in :class:`BaseSurvivalModule`.
+    Inherited epsilon and enable_checks options are forwarded to that class.
+    """
+    name = "competing_risks"
+
+    def __init__(self, latents, time_grid, *args, **kwargs):
+        r"""Initialize latent modules, parameter groups, and the integration grid.
+
+        See Also
+        --------
+        CompetingRisksSurvivalModule : Constructor parameters and formulas.
+        """
+        if len(latents) < 2:
+            raise ValueError("latents must contain at least two survival modules")
+        if (
+            time_grid.ndim != 1 or time_grid.numel() < 2 or time_grid[0] != 0
+            or not torch.isfinite(time_grid).all()
+            or not (time_grid[1:] > time_grid[:-1]).all()
+        ):
+            raise ValueError("time_grid must be a finite, strictly increasing vector starting at zero with at least two points")
+
+        latent_names = [
+            latent.__class__.__name__ + f"_#{k}" for k, latent in enumerate(latents)
+        ]
+        # each latent consumes its own block of raw parameters, kept raw here
+        super().__init__(
+            [
+                FreeParameter(name, n=latent.get_param_number())
+                for name, latent in zip(latent_names, latents)
+            ],
+            *args,
+            **kwargs,
+        )
+        self.latents = torch.nn.ModuleDict(zip(latent_names, latents))
+        self.n_causes = len(latents)
+        self.register_buffer("time_grid", time_grid)
+
+    def _stack_latents(self, mode, params, times):
+        r"""Evaluate one mode for every latent, stacking causes on the last axis.
+
+        Parameters
+        ----------
+        mode : str
+            Single-risk mode understood by every latent.
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared evaluation times.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Latent predictions in cause order.
+        """
+        return torch.stack(
+            [latent(mode, params[name], times) for name, latent in self.latents.items()],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _prod_others(x):
+        r"""Compute the product over the last axis excluding each element.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (..., n_causes)
+            Factors to multiply.
+
+        Returns
+        -------
+        torch.Tensor, shape (..., n_causes)
+            ``out[..., k]`` equals the product of ``x[..., j]`` for j != k.
+
+        Notes
+        -----
+        Uses exclusive prefix and suffix cumulative products instead of
+        dividing the full product by ``x[..., k]``, so it stays exact and
+        differentiable when some factors are zero.
+        """
+        ones = torch.ones_like(x[..., :1])
+        # prefix[k] = prod_{j<k} x_j
+        prefix = torch.cumprod(torch.cat([ones, x[..., :-1]], dim=-1), dim=-1)
+        # suffix[k] = prod_{j>k} x_j, built as a prefix product of the reversed factors
+        suffix = torch.cumprod(torch.cat([ones, x.flip(-1)[..., :-1]], dim=-1), dim=-1).flip(-1)
+        return prefix * suffix
+
+    def latent_survival(self, params, times):
+        r"""Return the latent survival functions S_k(t).
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Survival of each latent distribution.
+        """
+        return self._stack_latents("survival", params, times)
+
+    def cs_hazard(self, params, times):
+        r"""Return the cause-specific hazards, equal to the latent hazards h_k(t).
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Hazard of each latent distribution.
+        """
+        return self._stack_latents("hazard", params, times)
+
+    def cs_density(self, params, times):
+        r"""Return the subdensities f_k(t) prod_{j != k} S_j(t) = h_k(t) S(t).
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Density of observing cause k first at each time.
+        """
+        # the product form avoids dividing by a possibly vanishing S_k
+        latent_survival = self._stack_latents("survival", params, times)
+        latent_density = self._stack_latents("density", params, times)
+        return latent_density * self._prod_others(latent_survival)
+
+    def survival_and_density(self, params, times):
+        r"""Return all-cause survival and density sharing latent evaluations.
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        tuple of torch.Tensor, each shape (n_samples, n_times)
+            ``prod_k S_k`` and ``sum_k f_k prod_{j != k} S_j``.
+        """
+        latent_survival = self._stack_latents("survival", params, times)
+        latent_density = self._stack_latents("density", params, times)
+        survival = latent_survival.prod(dim=-1)
+        density = (latent_density * self._prod_others(latent_survival)).sum(dim=-1)
+        return survival, density
+
+    def survival(self, params, times):
+        r"""Return the all-cause survival prod_k S_k(t).
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times)
+            Probability that no event of any cause occurred by each time.
+        """
+        return self._stack_latents("survival", params, times).prod(dim=-1)
+
+    def density(self, params, times):
+        r"""Return the all-cause density, the sum of the subdensities.
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times)
+            Density of the first event of any cause.
+        """
+        return self.cs_density(params, times).sum(dim=-1)
+
+    def hazard(self, params, times):
+        r"""Return the all-cause hazard, the sum of the latent hazards.
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times)
+            Hazard of the first event of any cause.
+        """
+        return self.cs_hazard(params, times).sum(dim=-1)
+
+    def cif(self, params, times):
+        r"""Return the cumulative incidence functions F_k(t) by product integration.
+
+        Parameters
+        ----------
+        params : dict of str to torch.Tensor
+            Raw parameter group of each latent.
+        times : torch.Tensor, shape (n_times,)
+            Shared nonnegative evaluation times on the module device; they need
+            not be sorted or unique.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_samples, n_times, n_causes)
+            Probability that cause k occurs first by each time.
+
+        See Also
+        --------
+        CompetingRisksSurvivalModule : Integration scheme and its accuracy.
+        """
+        # Integration nodes: sorted union of the grid and the requested times.
+        # The inverse indices of the requested times locate them among the nodes,
+        # so they are returned exactly at a node instead of being interpolated.
+        nodes, inverse = torch.unique(
+            torch.cat([self.time_grid.to(times.dtype), times]),
+            sorted=True, return_inverse=True,
+        )
+        times_idx = inverse[len(self.time_grid):]
+
+        # Latent cumulative hazards H_k = -log S_k at the nodes, (n, L, K).
+        # The floor keeps the log finite if a latent survival underflows to zero.
+        latent_survival = self._stack_latents("survival", params, nodes)
+        cum_hazard = -torch.log(latent_survival.clamp_min(torch.finfo(latent_survival.dtype).tiny))
+
+        # Hazard mass of each cause on each interval [u_m, u_{m+1}], (n, L-1, K),
+        # floored at zero against rounding, and its total over causes.
+        d_cum_hazard = (cum_hazard[..., 1:, :] - cum_hazard[..., :-1, :]).clamp_min(0.0)
+        d_total = d_cum_hazard.sum(dim=-1, keepdim=True)
+
+        # All-cause survival at the start of each interval, S(u_m) = exp(-sum_k H_k(u_m)).
+        survival_start = torch.exp(-cum_hazard[..., :-1, :].sum(dim=-1, keepdim=True))
+
+        # (1 - exp(-x)) / x, replaced by its Taylor expansion near x = 0 where
+        # the ratio is 0/0; the safe denominator keeps both branches' gradients finite.
+        small = d_total < 1e-6
+        d_total_safe = torch.where(small, torch.ones_like(d_total), d_total)
+        ratio = torch.where(small, 1.0 - 0.5 * d_total, -torch.expm1(-d_total_safe) / d_total_safe)
+
+        # Exact ODE step under constant hazards on the interval: cause k takes the
+        # share d_cum_hazard_k / d_total of the all-cause mass S(u_m) (1 - exp(-d_total)).
+        d_cif = d_cum_hazard * survival_start * ratio
+
+        # F_k(u_0 = 0) = 0, then accumulate the increments along the time axis.
+        cif = torch.cat([torch.zeros_like(d_cif[..., :1, :]), torch.cumsum(d_cif, dim=-2)], dim=-2)
+        return cif[..., times_idx, :]
+
+
 import random  # FIXME use maybe torch and a generator for random
 
 
@@ -2792,5 +3241,6 @@ _COMPOSITE_SURVIVAL_MODULES = {
         ProportionalHazardSurvivalModule,
         AcceleratedFailureTimeSurvivalModule,
         MixtureSurvivalModule,
+        CompetingRisksSurvivalModule,
     ]
 }
