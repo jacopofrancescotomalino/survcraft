@@ -25,6 +25,10 @@ MODULE_DEFAULTS = {
     sm.MixtureSurvivalModule: {
         "baselines": [sm.ExponentialSurvivalModule(), sm.WeibullSurvivalModule()],
     },
+    sm.CompetingRisksSurvivalModule: {
+        "latents": [sm.ExponentialSurvivalModule(), sm.WeibullSurvivalModule()],
+        "time_grid": STEP_EXP_BREAKS,
+    },
 }
 
 
@@ -39,6 +43,7 @@ MANUAL_MODULE_CLASSES = sorted(
         sm.ProportionalHazardSurvivalModule,
         sm.AcceleratedFailureTimeSurvivalModule,
         sm.MixtureSurvivalModule,
+        sm.CompetingRisksSurvivalModule,
         sm.FractalNoiseSurvivalModule,
     ],
     key=lambda module_cls: module_cls.name,

@@ -95,6 +95,7 @@ def build_discovered_loss(loss_cls):
 EXPECTED_INCOMPATIBLE_COMBINATIONS = {
     (ad.LevySurvivalAdapter, lm.SquaredLoss),
     (ad.ProportionalHazardSurvivalAdapter, lm.SquaredLoss),
+    (ad.CompetingRisksSurvivalAdapter, lm.SquaredLoss),
 }
 
 

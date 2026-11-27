@@ -23,7 +23,8 @@ def test_fit_accepts_independent_target_field_names():
     (np.zeros(2), "exactly two fields"),
     (np.zeros(2, dtype=[("event", "?")]), "exactly two fields"),
     (np.zeros(2, dtype=[("event", "?"), ("time", "f4"), ("extra", "f4")]), "exactly two fields"),
-    (np.zeros(2, dtype=[("event", "i4"), ("time", "f4")]), "boolean events"),
+    (np.zeros(2, dtype=[("event", "f4"), ("time", "f4")]), "boolean events"),
+    (np.array([(-1, 1.0)], dtype=[("event", "i4"), ("time", "f4")]), "nonnegative integer cause codes"),
     (np.zeros(2, dtype=[("time", "f4"), ("event", "?")]), "boolean events"),
     (np.zeros(2, dtype=[("event", "?", (2,)), ("time", "f4")]), "boolean events"),
     *[(np.zeros(2, dtype=[("event", "?"), ("time", dtype)]), "real numeric times")

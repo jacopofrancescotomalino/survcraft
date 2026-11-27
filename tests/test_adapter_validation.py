@@ -159,7 +159,7 @@ def test_valid_step_breaks_construct(breaks):
 @pytest.mark.parametrize("event, time, message", [
     (None, [1, 2], "both"), ([True], None, "both"),
     ([True, False], [1], "matching"), ([[True]], [[1]], "one-dimensional"),
-    ([1, 0], [1, 2], "boolean"),
+    ([1.0, 0.0], [1, 2], "boolean"), ([1, -1], [1, 2], "nonnegative integer"),
     ([True, True], [np.nan, 2], "finite nonnegative"),
     ([True, True], [np.inf, 2], "finite nonnegative"),
     ([True, True], [-1, 2], "finite nonnegative"),

@@ -23,6 +23,10 @@ MODULE_DEFAULTS = {
     sm.MixtureSurvivalModule: {
         "baselines": [sm.ExponentialSurvivalModule(), sm.WeibullSurvivalModule()],
     },
+    sm.CompetingRisksSurvivalModule: {
+        "latents": [sm.ExponentialSurvivalModule(), sm.WeibullSurvivalModule()],
+        "time_grid": STEP_EXP_BREAKS,
+    },
     sm.FractalNoiseSurvivalModule: {
         "seed": 0,
     },
